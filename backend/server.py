@@ -24,6 +24,7 @@ from .webcam_track import WebcamStreamTrack
 from .ring_buffer import RingBuffer
 from .video_recorder import VideoRecorder
 from .event_video_saver import EventVideoSaver
+from .draw_utils import draw_detections
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ ring_buffer: Optional[RingBuffer] = None
 video_recorder: Optional[VideoRecorder] = None
 event_video_saver: Optional[EventVideoSaver] = None
 yolo_model = None  # lazily loaded
+# Annotated frame for live stream (YOLO boxes); track uses this when set
+annotated_frame_holder: dict = {"frame": None}
 
 # Recording state
 is_recording = False
@@ -47,6 +50,12 @@ postroll_task: Optional[asyncio.Task] = None
 status_websockets: Set[WebSocket] = set()
 
 BUFFER_SECONDS = 5  # pre-roll and post-roll duration
+
+# COCO animal classes – only these trigger event tracking/recording
+TRACK_ANIMAL_CLASSES = frozenset({
+    "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe",
+})
 
 
 def _new_clip_id() -> str:
@@ -84,7 +93,7 @@ async def lifespan(app: FastAPI):
     # Load YOLO for event-based recording (optional)
     try:
         from ultralytics import YOLO
-        yolo_model = YOLO("yolov26n.pt")
+        yolo_model = YOLO("yolo26n.pt")
         logger.info("YOLO model loaded for event recording")
     except Exception as e:
         logger.warning(f"YOLO not available (event recording disabled): {e}")
@@ -102,6 +111,13 @@ async def lifespan(app: FastAPI):
 
         ring_buffer = RingBuffer(duration_seconds=BUFFER_SECONDS, fps=cam_fps)
         video_recorder = VideoRecorder(fps=cam_fps)
+        async def on_event_recording_started(clip_id):
+            await broadcast_status({
+                "type": "recording_started",
+                "clip_id": clip_id,
+                "event": True,
+            })
+
         async def on_event_recording_saved(result):
             if result:
                 await broadcast_status({
@@ -115,6 +131,7 @@ async def lifespan(app: FastAPI):
             recording_buffer_seconds=3.5,
             preroll_seconds=BUFFER_SECONDS,
             on_recording_saved=on_event_recording_saved,
+            on_recording_started=on_event_recording_started,
         )
 
         # Consumer: feed every frame into the ring buffer
@@ -126,36 +143,56 @@ async def lifespan(app: FastAPI):
             if video_recorder.current_recording:
                 await video_recorder.add_frame(frame)
 
-        # Consumer: YOLO tracking + event-based recording (one active recording at a time)
+        # Consumer: YOLO tracking + event-based recording + draw boxes on live stream
         async def yolo_event_consumer(frame, _ts):
             if yolo_model is None or event_video_saver is None:
+                annotated_frame_holder["frame"] = frame
                 return
             try:
                 results = await asyncio.to_thread(_run_yolo_track, yolo_model, frame)
             except Exception as e:
                 logger.debug(f"YOLO track error: {e}")
+                annotated_frame_holder["frame"] = frame
                 return
             boxes = results[0].boxes
-            detections_present = (
-                boxes.id is not None and len(boxes.id) > 0
-            )
+            track_ids_raw = boxes.id.cpu().numpy().tolist() if (boxes is not None and boxes.id is not None) else []
             detected_classes = set()
             detections = []
+            bboxes_list = []
+            class_ids_list = []
+            conf_list = []
+            track_ids_filtered = []
             if boxes is not None:
-                track_ids = boxes.id.cpu().numpy().tolist() if boxes.id is not None else []
                 class_ids = boxes.cls.cpu().numpy().tolist()
                 confidences = boxes.conf.cpu().numpy().tolist()
                 bboxes = boxes.xyxy.cpu().numpy().tolist()
                 for i, cid in enumerate(class_ids):
                     name = yolo_model.names[int(cid)]
+                    if name not in TRACK_ANIMAL_CLASSES:
+                        continue
                     detected_classes.add(name)
+                    bboxes_list.append(bboxes[i])
+                    class_ids_list.append(name)
+                    conf_list.append(confidences[i])
+                    track_ids_filtered.append(int(track_ids_raw[i]) if i < len(track_ids_raw) else None)
                     detections.append({
-                        "track_id": int(track_ids[i]) if i < len(track_ids) else None,
+                        "track_id": int(track_ids_raw[i]) if i < len(track_ids_raw) else None,
                         "class_id": int(cid),
                         "class_name": name,
                         "confidence": round(confidences[i], 3),
                         "bbox": [round(x, 2) for x in bboxes[i]],
                     })
+            current_track_ids = {tid for tid in track_ids_filtered if tid is not None}
+            event_track_id = event_video_saver._event_track_id if event_video_saver.is_recording else None
+            annotated = draw_detections(
+                frame,
+                bboxes_list,
+                track_ids=track_ids_filtered,
+                class_names=class_ids_list,
+                confidences=conf_list,
+                event_track_id=event_track_id,
+            )
+            annotated_frame_holder["frame"] = annotated
             frame_info = {
                 "timestamp": _dt.utcnow().isoformat() + "Z",
                 "num_detections": len(detections),
@@ -163,7 +200,7 @@ async def lifespan(app: FastAPI):
             }
             fps = webcam_capture.measured_fps if webcam_capture else 30.0
             await event_video_saver.update(
-                detections_present=detections_present,
+                current_track_ids=current_track_ids,
                 detected_classes=detected_classes,
                 frame_info=frame_info,
                 fps=fps,
@@ -231,7 +268,7 @@ async def offer(request: Request):
             pcs.discard(pc)
 
     if webcam_capture and webcam_capture.is_running:
-        pc.addTrack(WebcamStreamTrack(webcam_capture))
+        pc.addTrack(WebcamStreamTrack(webcam_capture, annotated_frame_holder))
 
     await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=typ))
     answer = await pc.createAnswer()
@@ -347,6 +384,7 @@ def _clip_dict(clip_id: str) -> dict:
     """Build a JSON-safe dict for a single clip."""
     for c in video_recorder.list_clips():
         if c["clip_id"] == clip_id:
+            meta_path = video_recorder.clips_dir / f"{clip_id}_metadata.json"
             return {
                 **c,
                 "video_url": f"/api/clips/{c['clip_id']}/video",
@@ -354,6 +392,7 @@ def _clip_dict(clip_id: str) -> dict:
                     f"/api/clips/{c['clip_id']}/thumbnail"
                     if c["has_thumbnail"] else None
                 ),
+                "metadata_url": f"/api/clips/{clip_id}/metadata" if meta_path.exists() else None,
             }
     return {"clip_id": clip_id}
 
@@ -364,6 +403,7 @@ async def list_clips():
     raw = video_recorder.list_clips()
     clips = []
     for c in raw:
+        meta_path = video_recorder.clips_dir / f"{c['clip_id']}_metadata.json"
         clips.append({
             **c,
             "video_url": f"/api/clips/{c['clip_id']}/video",
@@ -371,6 +411,7 @@ async def list_clips():
                 f"/api/clips/{c['clip_id']}/thumbnail"
                 if c["has_thumbnail"] else None
             ),
+            "metadata_url": f"/api/clips/{c['clip_id']}/metadata" if meta_path.exists() else None,
         })
     return {"clips": clips}
 
@@ -420,10 +461,12 @@ async def delete_clip(clip_id: str):
 # ---------------------------------------------------------------------------
 @app.get("/api/recording/status")
 async def recording_status():
-    """Return current recording state."""
+    """Return current recording state (manual or event)."""
+    event_recording = event_video_saver is not None and event_video_saver.is_recording
     return {
-        "is_recording": is_recording,
-        "clip_id": recording_clip_id if is_recording else None,
+        "is_recording": is_recording or event_recording,
+        "clip_id": recording_clip_id if is_recording else (event_video_saver.current_clip_id if event_recording else None),
+        "event_recording": event_recording,
         "postroll_active": (
             postroll_task is not None and not postroll_task.done()
         ) if postroll_task else False,

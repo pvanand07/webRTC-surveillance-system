@@ -55,3 +55,4 @@ Thumbs.db
 *.log
 *.tmp
 .cache/
+backend/secrets.env

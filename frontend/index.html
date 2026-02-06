@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Simple Recorder</title>
+    <title>Simple Recorder – YOLO Event Recording</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -137,7 +137,10 @@
                         <circle cx="10" cy="10" r="6"/>
                     </svg>
                 </div>
-                <h1 class="text-[17px] font-semibold tracking-tight" style="color: var(--text-primary);">Simple Recorder</h1>
+                <div>
+                    <h1 class="text-[17px] font-semibold tracking-tight" style="color: var(--text-primary);">Simple Recorder</h1>
+                    <p class="text-[11px] mt-0.5" style="color: var(--text-tertiary);">Clips save automatically when objects are detected</p>
+                </div>
             </div>
             <div class="flex items-center gap-2.5 text-[13px] font-medium" style="color: var(--text-secondary);">
                 <span class="flex items-center gap-2 px-3 py-1.5 rounded-[var(--radius-full)]"
@@ -164,7 +167,7 @@
                      style="background: rgba(0,0,0,0.5); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.08);">
                     <span class="w-2.5 h-2.5 rounded-full rec-pulse" style="background: var(--accent-red);"></span>
                     <span class="text-[13px] font-semibold tracking-wide" style="color: var(--accent-red-dim);" v-if="recording">
-                        REC {{ recordingTime }}
+                        {{ eventRecording ? 'Event ' : '' }}REC {{ recordingTime }}
                     </span>
                     <span class="text-[13px] font-semibold" style="color: #ff9f0a;" v-else-if="postrolling">
                         Saving… {{ postrollCountdown }}s
@@ -189,16 +192,16 @@
         <div class="flex items-center justify-center gap-4 px-6 py-6 border-t border-[var(--border-subtle)]"
              style="background: var(--bg-elevated);">
             <button @click="toggleRecording"
-                    :disabled="postrolling"
+                    :disabled="postrolling || eventRecording"
                     class="btn-record flex items-center gap-3 px-8 py-3.5 rounded-[var(--radius-full)] font-semibold text-[15px] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-[var(--bg-elevated)] disabled:cursor-not-allowed"
                     :class="recording
                         ? 'text-white focus:ring-[var(--accent-red)]'
-                        : postrolling
+                        : postrolling || eventRecording
                             ? 'cursor-not-allowed'
                             : 'text-[var(--bg-base)] focus:ring-white'"
                     :style="recording
                         ? 'background: linear-gradient(180deg, var(--accent-red) 0%, #e6352e 100%); box-shadow: 0 4px 14px rgba(255,59,48,0.4);'
-                        : postrolling
+                        : postrolling || eventRecording
                             ? 'background: var(--bg-card); color: var(--text-tertiary);'
                             : 'background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.25);'">
                 <template v-if="!recording && !postrolling">
@@ -220,6 +223,7 @@
                     <span>Saving…</span>
                 </template>
             </button>
+            <p v-if="eventRecording" class="text-[12px] mt-2" style="color: var(--text-tertiary);">Event recording — stops 3.5s after last detection</p>
         </div>
     </div>
 
@@ -270,7 +274,10 @@
                 <!-- Info -->
                 <div class="px-3 py-2.5 flex items-center justify-between gap-2">
                     <div class="min-w-0 flex-1">
-                        <p class="text-[13px] font-medium truncate" style="color: var(--text-primary);">{{ formatDate(clip.created) }}</p>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <p class="text-[13px] font-medium truncate" style="color: var(--text-primary);">{{ formatDate(clip.created) }}</p>
+                            <span v-if="clip.metadata_url" class="text-[10px] font-medium px-1.5 py-0.5 rounded" style="background: rgba(48,209,88,0.2); color: var(--accent-green);">Event</span>
+                        </div>
                         <p class="text-[12px] mt-0.5" style="color: var(--text-tertiary);">{{ formatSize(clip.size_bytes) }}</p>
                     </div>
                     <button @click.stop="deleteClip(clip.clip_id)"
@@ -295,7 +302,7 @@
                           d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"/>
                 </svg>
                 <p class="text-[15px] font-medium" style="color: var(--text-secondary);">No recordings yet</p>
-                <p class="text-[13px] mt-1" style="color: var(--text-tertiary);">Press record to capture a clip</p>
+                <p class="text-[13px] mt-1" style="color: var(--text-tertiary);">Clips save automatically when objects are detected, or press record to capture manually</p>
             </div>
         </div>
     </aside>
@@ -309,8 +316,19 @@
             <!-- Modal header -->
             <div class="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)]">
                 <div>
-                    <p class="text-[15px] font-semibold" style="color: var(--text-primary);">{{ formatDate(playerClip.created) }}</p>
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <p class="text-[15px] font-semibold" style="color: var(--text-primary);">{{ formatDate(playerClip.created) }}</p>
+                        <span v-if="playerClip.metadata_url" class="text-[11px] font-medium px-2 py-0.5 rounded" style="background: rgba(48,209,88,0.2); color: var(--accent-green);">Event</span>
+                    </div>
                     <p class="text-[13px] mt-0.5" style="color: var(--text-tertiary);">{{ formatSize(playerClip.size_bytes) }}</p>
+                    <a v-if="playerClip.metadata_url" :href="playerClip.metadata_url" target="_blank" rel="noopener"
+                       class="inline-flex items-center gap-1.5 mt-2 text-[12px] font-medium transition-colors hover:underline"
+                       style="color: var(--accent-green);">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                        </svg>
+                        View metadata (JSON)
+                    </a>
                 </div>
                 <button @click="closePlayer"
                         class="modal-close-btn p-2.5 rounded-[var(--radius-md)] transition-colors duration-150"
@@ -345,6 +363,7 @@ createApp({
         // State
         const connected = ref(false);
         const recording = ref(false);
+        const eventRecording = ref(false);
         const postrolling = ref(false);
         const postrollCountdown = ref(0);
         const recordingTime = ref('00:00');
@@ -427,12 +446,14 @@ createApp({
             switch (msg.type) {
                 case 'recording_started':
                     recording.value = true;
+                    eventRecording.value = msg.event === true;
                     postrolling.value = false;
                     startRecordingTimer();
                     break;
 
                 case 'postroll_started':
                     recording.value = false;
+                    eventRecording.value = false;
                     postrolling.value = true;
                     stopRecordingTimer();
                     startPostrollCountdown(msg.seconds || 5);
@@ -440,9 +461,9 @@ createApp({
 
                 case 'recording_saved':
                     postrolling.value = false;
+                    eventRecording.value = false;
                     stopPostrollCountdown();
                     if (msg.clip) {
-                        // Prepend to clips list
                         clips.value.unshift(msg.clip);
                     } else {
                         fetchClips();
@@ -584,11 +605,12 @@ createApp({
             connectWS();
             fetchClips();
 
-            // Also poll recording status on load
+            // Poll recording status on load (manual + event)
             fetch('/api/recording/status')
                 .then(r => r.json())
                 .then(data => {
                     recording.value = data.is_recording;
+                    eventRecording.value = data.event_recording === true;
                     postrolling.value = data.postroll_active;
                     if (data.is_recording) startRecordingTimer();
                 })
@@ -607,7 +629,7 @@ createApp({
 
         return {
             liveVideo, playerVideo,
-            connected, recording, postrolling,
+            connected, recording, eventRecording, postrolling,
             postrollCountdown, recordingTime,
             clips, playerClip,
             toggleRecording, playClip, closePlayer, deleteClip,
