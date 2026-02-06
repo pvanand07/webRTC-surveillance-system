@@ -12,7 +12,7 @@ from datetime import datetime as _dt
 from pathlib import Path
 from typing import Set, Optional
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -213,8 +213,8 @@ async def start_recording():
 
 
 @app.post("/api/recording/stop")
-async def stop_recording():
-    """Stop recording. Server continues capturing for 5 s post-roll, then finalises."""
+async def stop_recording(postroll_seconds: int = Query(0, ge=0, description="Optional post-roll seconds; 0 = finalise immediately")):
+    """Stop recording. Optional post-roll: if postroll_seconds > 0, capture that many seconds after stop then finalise. Default 0 = finalise immediately."""
     global is_recording, postroll_task
 
     if not is_recording:
@@ -223,16 +223,26 @@ async def stop_recording():
     is_recording = False
     clip_id = recording_clip_id
 
+    if postroll_seconds <= 0:
+        # No post-roll: finalize immediately
+        result = await video_recorder.stop_recording()
+        if result:
+            await broadcast_status({
+                "type": "recording_saved",
+                "clip": _clip_dict(result["clip_id"]),
+            })
+        return {"status": "saved", "clip_id": clip_id, "postroll_seconds": 0}
+
+    # Post-roll: keep writing frames for postroll_seconds, then finalize
     await broadcast_status({
         "type": "postroll_started",
         "clip_id": clip_id,
-        "seconds": BUFFER_SECONDS,
+        "seconds": postroll_seconds,
     })
 
-    # Post-roll: keep writing frames for BUFFER_SECONDS, then finalize
     async def _postroll():
         try:
-            await asyncio.sleep(BUFFER_SECONDS)
+            await asyncio.sleep(postroll_seconds)
             result = await video_recorder.stop_recording()
             if result:
                 await broadcast_status({
@@ -244,7 +254,7 @@ async def stop_recording():
 
     postroll_task = asyncio.create_task(_postroll())
 
-    return {"status": "stopping", "clip_id": clip_id, "postroll_seconds": BUFFER_SECONDS}
+    return {"status": "stopping", "clip_id": clip_id, "postroll_seconds": postroll_seconds}
 
 
 # ---------------------------------------------------------------------------
