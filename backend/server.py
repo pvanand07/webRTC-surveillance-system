@@ -1,6 +1,7 @@
 """
 Simple Recorder Server
 FastAPI application with WebRTC streaming, manual recording with 5 s buffer,
+event-based recording on YOLO detection (stops when no object +3.5s),
 and clip management.
 """
 
@@ -22,6 +23,7 @@ from .webcam_capture import WebcamCapture
 from .webcam_track import WebcamStreamTrack
 from .ring_buffer import RingBuffer
 from .video_recorder import VideoRecorder
+from .event_video_saver import EventVideoSaver
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,6 +35,8 @@ pcs: Set[RTCPeerConnection] = set()
 webcam_capture: Optional[WebcamCapture] = None
 ring_buffer: Optional[RingBuffer] = None
 video_recorder: Optional[VideoRecorder] = None
+event_video_saver: Optional[EventVideoSaver] = None
+yolo_model = None  # lazily loaded
 
 # Recording state
 is_recording = False
@@ -66,11 +70,25 @@ async def broadcast_status(msg: dict):
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+def _run_yolo_track(model, frame):
+    """Run YOLO track in sync context (for asyncio.to_thread)."""
+    return model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global webcam_capture, ring_buffer, video_recorder
+    global webcam_capture, ring_buffer, video_recorder, event_video_saver, yolo_model
 
     logger.info("Starting Simple Recorder ...")
+
+    # Load YOLO for event-based recording (optional)
+    try:
+        from ultralytics import YOLO
+        yolo_model = YOLO("yolov26n.pt")
+        logger.info("YOLO model loaded for event recording")
+    except Exception as e:
+        logger.warning(f"YOLO not available (event recording disabled): {e}")
+        yolo_model = None
 
     try:
         webcam_capture = WebcamCapture(width=640, height=480, fps=30)
@@ -78,13 +96,26 @@ async def lifespan(app: FastAPI):
         webcam_capture.start(loop)
 
         # Wait for the capture loop to produce at least one measured FPS
-        # (reported FPS is often wrong; measured matches real frame delivery).
         await asyncio.sleep(3)
         cam_fps = webcam_capture.measured_fps
         logger.info(f"Webcam capture started (measured fps={cam_fps:.1f})")
 
         ring_buffer = RingBuffer(duration_seconds=BUFFER_SECONDS, fps=cam_fps)
         video_recorder = VideoRecorder(fps=cam_fps)
+        async def on_event_recording_saved(result):
+            if result:
+                await broadcast_status({
+                    "type": "recording_saved",
+                    "clip": _clip_dict(result["clip_id"]),
+                })
+
+        event_video_saver = EventVideoSaver(
+            video_recorder=video_recorder,
+            ring_buffer=ring_buffer,
+            recording_buffer_seconds=3.5,
+            preroll_seconds=BUFFER_SECONDS,
+            on_recording_saved=on_event_recording_saved,
+        )
 
         # Consumer: feed every frame into the ring buffer
         async def ring_buffer_consumer(frame, _ts):
@@ -95,12 +126,57 @@ async def lifespan(app: FastAPI):
             if video_recorder.current_recording:
                 await video_recorder.add_frame(frame)
 
+        # Consumer: YOLO tracking + event-based recording (one active recording at a time)
+        async def yolo_event_consumer(frame, _ts):
+            if yolo_model is None or event_video_saver is None:
+                return
+            try:
+                results = await asyncio.to_thread(_run_yolo_track, yolo_model, frame)
+            except Exception as e:
+                logger.debug(f"YOLO track error: {e}")
+                return
+            boxes = results[0].boxes
+            detections_present = (
+                boxes.id is not None and len(boxes.id) > 0
+            )
+            detected_classes = set()
+            detections = []
+            if boxes is not None:
+                track_ids = boxes.id.cpu().numpy().tolist() if boxes.id is not None else []
+                class_ids = boxes.cls.cpu().numpy().tolist()
+                confidences = boxes.conf.cpu().numpy().tolist()
+                bboxes = boxes.xyxy.cpu().numpy().tolist()
+                for i, cid in enumerate(class_ids):
+                    name = yolo_model.names[int(cid)]
+                    detected_classes.add(name)
+                    detections.append({
+                        "track_id": int(track_ids[i]) if i < len(track_ids) else None,
+                        "class_id": int(cid),
+                        "class_name": name,
+                        "confidence": round(confidences[i], 3),
+                        "bbox": [round(x, 2) for x in bboxes[i]],
+                    })
+            frame_info = {
+                "timestamp": _dt.utcnow().isoformat() + "Z",
+                "num_detections": len(detections),
+                "detections": detections,
+            }
+            fps = webcam_capture.measured_fps if webcam_capture else 30.0
+            await event_video_saver.update(
+                detections_present=detections_present,
+                detected_classes=detected_classes,
+                frame_info=frame_info,
+                fps=fps,
+            )
+
         webcam_capture.add_consumer(ring_buffer_consumer)
         webcam_capture.add_consumer(recorder_consumer)
+        if yolo_model is not None:
+            webcam_capture.add_consumer(yolo_event_consumer)
     except Exception as e:
         logger.warning(f"Webcam not available: {e}")
         webcam_capture = None
-        # Fallback: create buffer/recorder with default fps
+        event_video_saver = None
         ring_buffer = RingBuffer(duration_seconds=BUFFER_SECONDS, fps=30.0)
         video_recorder = VideoRecorder(fps=30.0)
 
@@ -109,6 +185,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down ...")
+    if event_video_saver:
+        await event_video_saver.cleanup()
     if video_recorder and video_recorder.current_recording:
         await video_recorder.stop_recording()
     if webcam_capture:
@@ -175,6 +253,11 @@ async def start_recording():
 
     if is_recording:
         return JSONResponse(status_code=409, content={"error": "Already recording"})
+    if event_video_saver and event_video_saver.is_recording:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "Event recording in progress; only one active recording at a time"},
+        )
 
     # If a previous post-roll is still running, finalize it immediately
     if postroll_task and not postroll_task.done():
@@ -310,12 +393,24 @@ async def get_clip_thumbnail(clip_id: str):
     return FileResponse(str(path), media_type="image/jpeg")
 
 
+@app.get("/api/clips/{clip_id}/metadata")
+async def get_clip_metadata(clip_id: str):
+    """Serve event metadata JSON for a clip (if present)."""
+    meta_path = video_recorder.clips_dir / f"{clip_id}_metadata.json"
+    if not meta_path.exists():
+        return JSONResponse(status_code=404, content={"error": "Metadata not found"})
+    return FileResponse(str(meta_path), media_type="application/json")
+
+
 @app.delete("/api/clips/{clip_id}")
 async def delete_clip(clip_id: str):
-    """Delete a clip and its thumbnail."""
+    """Delete a clip, its thumbnail, and metadata (if any)."""
     ok = video_recorder.delete_clip(clip_id)
     if not ok:
         return JSONResponse(status_code=404, content={"error": "Clip not found"})
+    meta_path = video_recorder.clips_dir / f"{clip_id}_metadata.json"
+    if meta_path.exists():
+        meta_path.unlink()
     await broadcast_status({"type": "clip_deleted", "clip_id": clip_id})
     return {"deleted": clip_id}
 
